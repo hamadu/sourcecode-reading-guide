@@ -1,0 +1,237 @@
+// 必読 : https://www.sqlite.org/arch.html
+
+<WAL mode := Write-Ahead Logging>
+https://www.sqlite.org/wal.html
+
+VDBE or Virtual DataBase Engine
+
+
+[main.c]
+sqlite3_open, sqlite3_close とか外部に公開するAPIはいってる。
+そこから呼ぶ内部の処理も書かれてる。
+
+<sqlite3_db_mutex(sqlite3 *db)>
+???
+
+[table.c]
+// テーブル全体に対してクエリ。各行ごとにcallbackするのではなく、結果全体を返す
+int sqlite3_get_table(
+  sqlite3 *db,                /* The database on which the SQL executes */
+  const char *zSql,           /* The SQL to be executed */
+  char ***pazResult,          /* Write the result table here */
+  int *pnRow,                 /* Write the number of rows in the result here */
+  int *pnColumn,              /* Write the number of columns of result here */
+  char **pzErrMsg             /* Write error messages here */
+)
+
+[legacy.c]
+// SQLをパースして実行。結果の各行に対して xCallback を実行する。
+int sqlite3_exec(
+  sqlite3 *db,                /* The database on which the SQL executes */
+  const char *zSql,           /* The SQL to be executed */
+  sqlite3_callback xCallback, /* Invoke this callback routine */
+  void *pArg,                 /* First argument to xCallback() */
+  char **pzErrMsg             /* Write error messages here */
+)
+	: sqlite3_mutex_enter
+	: while
+	  : sqlite3_stmt *pStmt
+	  : sqlite3_prepare_v2(db, zSql, -1, pStmt, zLeftover)
+	  : nCol = sqlite3_column_count(pStmt)
+	  : while
+	    : sqlite3_step(pStmt)
+	    : if (xCallback) { callback }
+	  : sqlite3DbFree
+	: sqlite3_mutex_leave
+
+[prepare.c]
+int sqlite3_prepare_v2(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nBytes,               /* Length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pzTail       /* OUT: End of parsed string */
+)
+	: sqlite3LockAndPrepare(db,zSql,nBytes,1,0,ppStmt,pzTail);
+
+static int sqlite3LockAndPrepare(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nBytes,               /* Length of zSql in bytes. */
+  int saveSqlFlag,          /* True to copy SQL text into the sqlite3_stmt */
+  Vdbe *pOld,               /* VM being reprepared */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pzTail       /* OUT: End of parsed string */
+)
+	: sqlite3_mutex_enter
+	: sqlite3BtreeEnterAll
+	: sqlite3Prepare
+	: sqlite3BtreeLeaveAll
+	: sqlite3_mutex_leave
+
+
+static int sqlite3Prepare(
+  sqlite3 *db,              /* Database handle. */
+  const char *zSql,         /* UTF-8 encoded SQL statement. */
+  int nBytes,               /* Length of zSql in bytes. */
+  int saveSqlFlag,          /* True to copy SQL text into the sqlite3_stmt */
+  Vdbe *pReprepare,         /* VM being reprepared */
+  sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+  const char **pzTail       /* OUT: End of parsed string */
+)
+	: Parse *pParse = sqlite3StackAllocZero
+
+[whereInt.h]
+
+// スキャン情報
+struct WhereScan {
+  WhereClause *pOrigWC;      /* Original, innermost WhereClause */
+  WhereClause *pWC;          /* WhereClause currently being scanned */
+  const char *zCollName;     /* Required collating sequence, if not NULL */
+  Expr *pIdxExpr;            /* Search for this index expression */
+  char idxaff;               /* Must match this affinity, if zCollName!=NULL */
+  unsigned char nEquiv;      /* Number of entries in aEquiv[] */
+  unsigned char iEquiv;      /* Next unused slot in aEquiv[] */
+  u32 opMask;                /* Acceptable operators */
+  int k;                     /* Resume scanning at this->pWC->a[this->k] */
+  int aiCur[11];             /* Cursors in the equivalence class */
+  i16 aiColumn[11];          /* Corresponding column number in the eq-class */
+};
+
+// andで結ばれた項
+struct WhereClause {
+  WhereInfo *pWInfo;       /* WHERE clause processing context */
+  WhereClause *pOuter;     /* Outer conjunction */
+  u8 op;                   /* Split operator.  TK_AND or TK_OR */
+  int nTerm;               /* Number of terms */
+  int nSlot;               /* Number of entries in a[] */
+  WhereTerm *a;            /* Each a[] describes a term of the WHERE cluase */
+#if defined(SQLITE_SMALL_STACK)
+  WhereTerm aStatic[1];    /* Initial static space for a[] */
+#else
+  WhereTerm aStatic[8];    /* Initial static space for a[] */
+#endif
+};
+
+// 単一の条件
+struct WhereTerm {
+  Expr *pExpr;            /* Pointer to the subexpression that is this term */
+  int iParent;            /* Disable pWC->a[iParent] when this term disabled */
+  int leftCursor;         /* Cursor number of X in "X <op> <expr>" */
+  union {
+    int leftColumn;         /* Column number of X in "X <op> <expr>" */
+    WhereOrInfo *pOrInfo;   /* Extra information if (eOperator & WO_OR)!=0 */
+    WhereAndInfo *pAndInfo; /* Extra information if (eOperator& WO_AND)!=0 */
+  } u;
+  LogEst truthProb;       /* Probability of truth for this expression */
+  u16 eOperator;          /* A WO_xx value describing <op> */
+  u16 wtFlags;            /* TERM_xxx bit flags.  See below */
+  u8 nChild;              /* Number of children that must disable us */
+  u8 eMatchOp;            /* Op for vtab MATCH/LIKE/GLOB/REGEXP terms */
+  WhereClause *pWC;       /* The clause this term is part of */
+  Bitmask prereqRight;    /* Bitmask of tables used by pExpr->pRight */
+  Bitmask prereqAll;      /* Bitmask of tables referenced by pExpr */
+};
+
+
+[where.c] : where実行機能兼オプティマイザ。
+
+
+// WhereScan *pScanオブジェクトを初期化してwhereScanNextを呼ぶ
+static WhereTerm *whereScanInit(
+  WhereScan *pScan,       /* The WhereScan object being initialized */
+  WhereClause *pWC,       /* The WHERE clause to be scanned */
+  int iCur,               /* Cursor to scan for */
+  int iColumn,            /* Column to scan for */
+  u32 opMask,             /* Operator(s) to scan for */
+  Index *pIdx             /* Must be compatible with this index */
+)
+	: whereScanNext
+
+// 
+static WhereTerm *whereScanNext(WhereScan *pScan)
+
+
+[btreeInt.h]
+
+// DBにつき一つだけ(複数のコネクションで使い回す)
+struct BtShared {
+  Pager *pPager;        /* The page cache */
+  sqlite3 *db;          /* Database connection currently using this Btree */
+  BtCursor *pCursor;    /* A list of all open cursors */
+  MemPage *pPage1;      /* First page of the database */
+  u8 openFlags;         /* Flags to sqlite3BtreeOpen() */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  u8 autoVacuum;        /* True if auto-vacuum is enabled */
+  u8 incrVacuum;        /* True if incr-vacuum is enabled */
+  u8 bDoTruncate;       /* True to truncate db on commit */
+#endif
+  u8 inTransaction;     /* Transaction state */
+  u8 max1bytePayload;   /* Maximum first byte of cell for a 1-byte payload */
+#ifdef SQLITE_HAS_CODEC
+  u8 optimalReserve;    /* Desired amount of reserved space per page */
+#endif
+  u16 btsFlags;         /* Boolean parameters.  See BTS_* macros below */
+  u16 maxLocal;         /* Maximum local payload in non-LEAFDATA tables */
+  u16 minLocal;         /* Minimum local payload in non-LEAFDATA tables */
+  u16 maxLeaf;          /* Maximum local payload in a LEAFDATA table */
+  u16 minLeaf;          /* Minimum local payload in a LEAFDATA table */
+  u32 pageSize;         /* Total number of bytes on a page */
+  u32 usableSize;       /* Number of usable bytes on each page */
+  int nTransaction;     /* Number of open transactions (read + write) */
+  u32 nPage;            /* Number of pages in the database */
+  void *pSchema;        /* Pointer to space allocated by sqlite3BtreeSchema() */
+  void (*xFreeSchema)(void*);  /* Destructor for BtShared.pSchema */
+  sqlite3_mutex *mutex; /* Non-recursive mutex required to access this object */
+  Bitvec *pHasContent;  /* Set of pages moved to free-list this transaction */
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  int nRef;             /* Number of references to this structure */
+  BtShared *pNext;      /* Next on a list of sharable BtShared structs */
+  BtLock *pLock;        /* List of locks held on this shared-btree struct */
+  Btree *pWriter;       /* Btree with currently open write transaction */
+#endif
+  u8 *pTmpSpace;        /* Temp space sufficient to hold a single cell */
+};
+
+// コネクションごとに作られる
+struct Btree {
+  sqlite3 *db;       /* The database connection holding this btree */
+  BtShared *pBt;     /* Sharable content of this btree */
+  u8 inTrans;        /* TRANS_NONE, TRANS_READ or TRANS_WRITE */
+  u8 sharable;       /* True if we can share pBt with another db */
+  u8 locked;         /* True if db currently has pBt locked */
+  u8 hasIncrblobCur; /* True if there are one or more Incrblob cursors */
+  int wantToLock;    /* Number of nested calls to sqlite3BtreeEnter() */
+  int nBackup;       /* Number of backup operations reading this btree */
+  u32 iDataVersion;  /* Combines with pBt->pPager->iDataVersion */
+  Btree *pNext;      /* List of other sharable Btrees from the same db */
+  Btree *pPrev;      /* Back pointer of the same list */
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  BtLock lock;       /* Object used to lock page 1 */
+#endif
+};
+
+struct BtLock {
+  Btree *pBtree;        /* Btree handle holding this lock */
+  Pgno iTable;          /* Root page of table */
+  u8 eLock;             /* READ_LOCK or WRITE_LOCK */
+  BtLock *pNext;        /* Next in BtShared.pLock list */
+};
+
+[btree.c]
+int sqlite3BtreePutData(BtCursor *pCsr, u32 offset, u32 amt, void *z)
+	: accessPayload
+	
+static int accessPayload(
+  BtCursor *pCur,      /* Cursor pointing to entry to read from */
+  u32 offset,          /* Begin reading this far into payload */
+  u32 amt,             /* Read this many bytes */
+  unsigned char *pBuf, /* Write the bytes into this buffer */ 
+  int eOp              /* zero to read. non-zero to write. */
+)
+	: getCellInfo
+	: copyPayload
+	: for <iIdx>
+	  : sqlite3PagerGet
+	  
+
